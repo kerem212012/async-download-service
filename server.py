@@ -1,10 +1,10 @@
 import asyncio
-from io import BytesIO
+from contextlib import suppress
 import logging
 import os
 from pathlib import Path
 import re
-from zipfile import ZIP_DEFLATED, ZipFile
+import sys
 
 from aiohttp import web
 import aiofiles
@@ -31,17 +31,15 @@ async def archive(request):
     if archive_dir.resolve().parent != photos_dir.resolve() or not archive_dir.is_dir():
         raise web.HTTPNotFound(text='Архив не существует или был удален')
 
-    def build_archive():
-        archive_buffer = BytesIO()
-        with ZipFile(archive_buffer, mode='w', compression=ZIP_DEFLATED) as zip_file:
-            for file_path in archive_dir.rglob('*'):
-                if file_path.is_file():
-                    archive_name = file_path.relative_to(archive_dir).as_posix()
-                    zip_file.write(file_path, arcname=archive_name)
-        return archive_buffer.getvalue()
-
-    loop = asyncio.get_event_loop()
-    archive_contents = await loop.run_in_executor(None, build_archive)
+    archive_worker = Path(__file__).with_name('archive_worker.py')
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(archive_worker),
+        str(archive_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr_task = asyncio.get_event_loop().create_task(process.stderr.read())
     response = web.StreamResponse(
         headers={
             'Content-Type': 'application/zip',
@@ -50,20 +48,46 @@ async def archive(request):
             )
         },
     )
-    await response.prepare(request)
+    download_interrupted = True
     try:
-        for offset in range(0, len(archive_contents), ARCHIVE_CHUNK_SIZE):
+        await response.prepare(request)
+        while True:
+            chunk = await process.stdout.read(ARCHIVE_CHUNK_SIZE)
+            if not chunk:
+                break
             if ARCHIVE_CHUNK_DELAY > 0:
                 await asyncio.sleep(ARCHIVE_CHUNK_DELAY)
-            chunk = archive_contents[offset:offset + ARCHIVE_CHUNK_SIZE]
             logger.debug('Sending archive chunk ... (%d bytes)', len(chunk))
             await response.write(chunk)
+
+        return_code = await process.wait()
+        error_output = await stderr_task
+        if return_code:
+            logger.error(
+                'Archive worker failed for %s (exit code %d): %s',
+                archive_hash,
+                return_code,
+                error_output.decode('utf-8', errors='replace').strip(),
+            )
+            raise RuntimeError(
+                'Archive worker failed with exit code {}'.format(return_code)
+            )
+
         await response.write_eof()
-    except asyncio.CancelledError:
-        logger.debug('Archive download cancelled for %s', archive_hash)
-        raise
-    except ConnectionError:
-        logger.debug('Client disconnected while downloading archive %s', archive_hash)
+        download_interrupted = False
+    finally:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await stderr_task
+        if download_interrupted:
+            logger.debug('Download was interrupted')
     return response
 
 
