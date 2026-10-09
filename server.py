@@ -81,11 +81,11 @@ async def archive(request):
                 process.kill()
             except ProcessLookupError:
                 pass
-        await process.wait()
         if not stderr_task.done():
             stderr_task.cancel()
             with suppress(asyncio.CancelledError):
                 await stderr_task
+        await process.communicate()
         if download_interrupted:
             logger.debug('Download was interrupted')
     return response
@@ -106,4 +106,4 @@ if __name__ == '__main__':
         web.get('/archive/{archive_hash}', archive),
         web.get('/archive/{archive_hash}/', archive),
     ])
-    web.run_app(app)
+    web.run_app(app, shutdown_timeout=1)
